@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Enter Text</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+    .form-section {
+      margin-bottom: 30px;
+      padding: 20px;
+      border: 1px solid #ddd;
+      border-radius: 5px;
+    }
+    textarea {
+      width: 100%;
+      padding: 10px;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      resize: vertical;
+    }
+    button {
+      background-color: #007bff;
+      color: white;
+      padding: 10px 20px;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      margin-top: 10px;
+    }
+    button:hover {
+      background-color: #0056b3;
+    }
+    .texts-section {
+      margin-top: 30px;
+    }
+    .text-item {
+      background-color: #f8f9fa;
+      padding: 15px;
+      margin-bottom: 10px;
+      border-radius: 4px;
+      border-left: 4px solid #007bff;
+      max-height: 250px;
+      overflow-y: auto;
+      word-break: break-word;
+    }
+    .text-content {
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .text-meta {
+      color: #666;
+      font-size: 12px;
+    }
+    .loading {
+      text-align: center;
+      color: #666;
+      font-style: italic;
+    }
+    .error {
+      color: #dc3545;
+      background-color: #f8d7da;
+      padding: 10px;
+      border-radius: 4px;
+      margin: 10px 0;
+    }
+    .gpt-response {
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+  </style>
+</head>
+<body>
+  <div class="form-section">
+    <h1>Enter your text</h1>
+    <form id="textForm">
+      <textarea name="textInput" rows="4" cols="50" required placeholder="Enter your text here..."></textarea><br>
+      <label for="modelSelect">Model:</label>
+      <select id="modelSelect" name="model">
+        <option value="llama3">Llama 3</option>
+        <option value="mistral">Mistral</option>
+        <option value="gemma:2b">Gemma</option>
+      </select><br>
+      <button type="submit">Submit</button>
+    </form>
+    <div id="submitMessage"></div>
+  </div>
+
+  <button id="deleteAllBtn" style="background-color:#dc3545;margin-bottom:20px;">Delete All</button>
+
+  <div class="texts-section">
+    <h2>Submitted Texts</h2>
+    <div id="textsContainer">
+      <div class="loading">Loading submitted texts...</div>
+    </div>
+  </div>
+
+  <script>
+    // Load submitted texts when page loads
+    document.addEventListener('DOMContentLoaded', function() {
+      loadTexts();
+    });
+
+    // Handle form submission
+    document.getElementById('textForm').addEventListener('submit', function(e) {
+      e.preventDefault();
+      
+      const textInput = document.querySelector('textarea[name="textInput"]');
+      const submitMessage = document.getElementById('submitMessage');
+      
+      if (!textInput.value.trim()) {
+        submitMessage.innerHTML = '<div class="error">Please enter some text.</div>';
+        return;
+      }
+
+      // Create a new text item in the UI for real-time streaming
+      const textsContainer = document.getElementById('textsContainer');
+      const tempId = 'temp-' + Date.now();
+      const tempDiv = document.createElement('div');
+      tempDiv.className = 'text-item';
+      tempDiv.id = tempId;
+      const selectedModel = document.getElementById('modelSelect').value;
+      tempDiv.innerHTML = `
+        <div class="text-content">${escapeHtml(textInput.value)}</div>
+        <div class="text-meta">Submitted: just now | Model: ${selectedModel}</div>
+        <div class="gpt-response"><span style="color:#888;">AI response:</span> <span class="gpt-stream"></span></div>
+      `;
+      textsContainer.prepend(tempDiv);
+
+      // Stream the GPT response
+      const gptStreamSpan = tempDiv.querySelector('.gpt-stream');
+      const eventSource = new EventSourcePolyfill('/api/stream_gpt', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: textInput.value, model: selectedModel })
+      });
+      let fullResponse = '';
+      eventSource.onmessage = function(event) {
+        if (event.data === '[DONE]') {
+          eventSource.close();
+          // The streaming endpoint now automatically saves to the database
+          // Reload the texts from DB to get the saved version with proper ID
+          setTimeout(loadTexts, 1000);
+        } else {
+          const data = JSON.parse(event.data);
+          if (data.content) {
+            fullResponse += data.content;
+            gptStreamSpan.textContent = fullResponse;
+          }
+          if (data.error) {
+            gptStreamSpan.innerHTML = `<span class="error">${data.error}</span>`;
+            console.error('Streaming error:', data.error);
+            eventSource.close();
+          }
+        }
+      };
+      eventSource.onerror = function(e) {
+        gptStreamSpan.innerHTML = '<span class="error">Streaming error.</span>';
+        console.error('Streaming connection error:', e);
+        eventSource.close();
+      };
+
+      textInput.value = '';
+      submitMessage.innerHTML = '';
+    });
+
+    // Polyfill for EventSource with POST support
+    // (since native EventSource only supports GET)
+    function EventSourcePolyfill(url, options) {
+      const controller = new AbortController();
+      const signal = controller.signal;
+      const readers = [];
+      let onmessage = null, onerror = null;
+      fetch(url, {
+        method: options.method || 'GET',
+        headers: options.headers,
+        body: options.body,
+        signal
+      }).then(response => {
+        const reader = response.body.getReader();
+        let buffer = '';
+        function read() {
+          reader.read().then(({ done, value }) => {
+            if (done) return;
+            buffer += new TextDecoder().decode(value, { stream: true });
+            let parts = buffer.split('\n\n');
+            buffer = parts.pop();
+            for (const part of parts) {
+              if (part.startsWith('data: ')) {
+                const data = part.slice(6);
+                if (onmessage) onmessage({ data });
+              }
+            }
+            read();
+          });
+        }
+        read();
+      }).catch(() => {
+        if (onerror) onerror();
+      });
+      return {
+        close: () => controller.abort(),
+        set onmessage(fn) { onmessage = fn; },
+        set onerror(fn) { onerror = fn; }
+      };
+    }
+
+    // Function to load and display submitted texts
+    function loadTexts() {
+      const textsContainer = document.getElementById('textsContainer');
+      
+      fetch('/api/texts')
+        .then(response => response.json())
+        .then(data => {
+          if (data.texts && data.texts.length > 0) {
+            const textsHTML = data.texts.map(text => `
+              <div class="text-item" data-id="${text.id}">
+                <div class="text-content">${escapeHtml(text.text)}</div>
+                <div class="text-meta">Submitted: ${formatDate(text.created_at)} | Model: ${escapeHtml(text.model || '')}</div>
+                <div class="gpt-response"><span style="color:#888;">AI response:</span> ${escapeHtml(text.gpt_response || '')}</div>
+                <button class="delete-btn" style="background-color:#dc3545;color:white;margin-top:5px;">Delete</button>
+              </div>
+            `).join('');
+            textsContainer.innerHTML = textsHTML;
+
+            // Add event listeners for individual delete buttons
+            document.querySelectorAll('.delete-btn').forEach(btn => {
+              btn.addEventListener('click', function() {
+                const textId = this.closest('.text-item').getAttribute('data-id');
+                if (!confirm('Delete this text?')) return;
+                fetch(`/api/texts/${textId}`, { method: 'DELETE' })
+                  .then(response => response.json())
+                  .then(data => {
+                    alert(data.message || data.error);
+                    loadTexts();
+                  })
+                  .catch(error => {
+                    alert('Error: ' + error.message);
+                    console.error('Error deleting text:', error);
+                  });
+              });
+            });
+          } else {
+            textsContainer.innerHTML = '<div class="loading">No texts submitted yet.</div>';
+          }
+        })
+        .catch(error => {
+          textsContainer.innerHTML = `<div class="error">Error loading texts: ${error.message}</div>`;
+          console.error('Error loading texts:', error);
+        });
+    }
+
+    // Helper function to escape HTML
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    // Helper function to format date
+    function formatDate(dateString) {
+      const date = new Date(dateString);
+      return date.toLocaleString();
+    }
+
+    // Add Delete All button handler
+    document.getElementById('deleteAllBtn').addEventListener('click', function() {
+      if (!confirm('Are you sure you want to delete all submitted texts?')) return;
+      fetch('/api/texts', { method: 'DELETE' })
+        .then(response => response.json())
+        .then(data => {
+          alert(data.message || data.error);
+          loadTexts();
+        })
+        .catch(error => {
+          alert('Error: ' + error.message);
+          console.error('Error deleting all texts:', error);
+        });
+    });
+  </script>
+</body>
+</html>
